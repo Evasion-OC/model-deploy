@@ -1,0 +1,23 @@
+{
+  "model": "gpt2",
+  "eval_tokens": 4096,
+  "seq": 256,
+  "parity_max_abs_logit_diff": 0.00079345703125,
+  "manual_quantized_tensors": 48,
+  "nll": {
+    "torch_fp32": 4.7579726967910565,
+    "torch_manual_int8_weight_only": 4.7545772790035485,
+    "ort_fp32": 4.757997160241033,
+    "ort_dynamic_int8": 4.910978304322907
+  },
+  "nll_delta_vs_torch_fp32": {
+    "torch_fp32": 0.0,
+    "torch_manual_int8_weight_only": -0.0033954177875079594,
+    "ort_fp32": 2.446344997686367e-05,
+    "ort_dynamic_int8": 0.15300560753185088
+  },
+  "sizes_mb": {
+    "onnx_fp32": 498.776189,
+    "onnx_int8": 125.759146
+  }
+}

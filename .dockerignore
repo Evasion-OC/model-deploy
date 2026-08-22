@@ -1,0 +1,11 @@
+artifacts/gpt2.onnx
+artifacts/gpt2_int8.onnx
+artifacts/*.data
+.venv/
+__pycache__/
+.git/
+models/
+export/
+bench/
+tests/
+results/

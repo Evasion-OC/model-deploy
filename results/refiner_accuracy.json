@@ -1,0 +1,31 @@
+{
+  "checkpoint": "spectral_refiner_k16_eps_0_03.pt",
+  "manual_quantized_tensors": 23,
+  "rows": [
+    {
+      "n": 300,
+      "ort_fp32_vs_torch": 1.8297247095233615e-07,
+      "ort_dynamic_int8_vs_torch": 0.5278430581092834,
+      "manual_int8_per_tensor_vs_torch": 0.005322447046637535,
+      "manual_int8_per_channel_vs_torch": 0.003218933939933777
+    },
+    {
+      "n": 1000,
+      "ort_fp32_vs_torch": 2.1948928008441726e-07,
+      "ort_dynamic_int8_vs_torch": 0.6535657048225403,
+      "manual_int8_per_tensor_vs_torch": 0.006339237559586763,
+      "manual_int8_per_channel_vs_torch": 0.004294258076697588
+    },
+    {
+      "n": 2000,
+      "ort_fp32_vs_torch": 2.169227286685782e-07,
+      "ort_dynamic_int8_vs_torch": 0.6101025342941284,
+      "manual_int8_per_tensor_vs_torch": 0.00795772299170494,
+      "manual_int8_per_channel_vs_torch": 0.005051078740507364
+    }
+  ],
+  "sizes_mb": {
+    "onnx_fp32": 0.72001,
+    "onnx_int8": 0.240799
+  }
+}
