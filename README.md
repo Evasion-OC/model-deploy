@@ -50,9 +50,21 @@ serves. Refiner: 0.72 → 0.22 MB at 0.4–0.6% drift; GPT-2: 499 → 244 MB at 
 and memory, not CPU compute: int8 *compute* needs activation quantization, which is exactly what damages
 these two models. The server prefers these artifacts.
 
-### Latency
-See `results/latency.md` (median of 20, CPU): torch eager vs `torch.compile` vs ORT fp32 vs ORT weight-only
-int8 vs ORT dynamic int8, for the encoder at n = 5,000 / 20,000 and GPT-2 at batch 1, seq 128.
+### Latency (CPU, Apple M-series, 8 torch threads; median of 20 after warm-up; `results/latency.md`)
+| model | torch eager | ORT fp32 | ORT weight-only int8 | ORT dynamic int8 |
+|---|---|---|---|---|
+| refiner encoder, n = 5,000 | **22.6 ms** | 55.5 | 56.1 | 53.8 |
+| refiner encoder, n = 20,000 | **86.2 ms** | 233.3 | 235.0 | 224.3 |
+| GPT-2 124M, batch 1, seq 128 | 65.5 ms | 78.5 | 51.7 | **30.9 ms** |
+
+**Finding 4 — the runtime is not automatically the faster one.** For the spectral encoder, ONNX Runtime's CPU
+provider is 2.5–2.7× *slower* than PyTorch eager on this machine (many small ops, scatter-based message
+passing, and no Apple-Accelerate BLAS in ORT's CPU provider), and int8 buys nothing because the Gemm weight
+layers were never quantized (Finding 2). For GPT-2 the picture inverts: ORT dynamic int8 is **2.1× faster**
+than torch eager (int8 MatMul kernels on ARM dot-product instructions) at the +0.15-nat accuracy cost above,
+and the lossless weight-only graph is 1.27× faster than eager. The deployment choice is therefore per model
+and per constraint — size, accuracy, or latency — and this repo measures all three before choosing.
+`torch.compile` is not in the table: its C++ backend stalled on this macOS setup, which is itself a data point.
 
 ## Serving
 `serve/app.py` (FastAPI, ONNX Runtime only — the image contains no PyTorch and no model code):

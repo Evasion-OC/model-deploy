@@ -47,16 +47,19 @@ def compile_or_none(model):
 
 def main():
     ap = argparse.ArgumentParser(); ap.add_argument("--runs", type=int, default=20); ap.add_argument("--seq", type=int, default=128)
+    ap.add_argument("--skip-compile", action="store_true", help="skip torch.compile (its C++ backend can stall on macOS CPU)")
     a = ap.parse_args()
     art = os.path.join(ROOT, "artifacts"); lines = []
     hdr = f"platform {platform.machine()} / {platform.system()}, torch {torch.__version__} ({torch.get_num_threads()} threads), onnxruntime {ort.__version__}"
-    print(hdr); lines.append(f"## CPU latency (median of {a.runs}, ms)\n\n{hdr}\n")
+    if a.skip_compile:
+        hdr += "; torch.compile not measured (--skip-compile: inductor's C++ backend stalled on this macOS CPU setup)"
+    print(hdr, flush=True); lines.append(f"## CPU latency (median of {a.runs}, ms)\n\n{hdr}\n")
 
     # --- refiner encoder ---
     enc, sd = build_encoder(os.path.join(ROOT, "models", "refiner", "spectral_refiner_k16_eps_0_03.pt"))
     s32, s8 = sess(os.path.join(art, "refiner_encoder.onnx")), sess(os.path.join(art, "refiner_encoder_int8.onnx"))
     sw8 = sess(os.path.join(art, "refiner_encoder_w8.onnx"))
-    enc_c = compile_or_none(enc)
+    enc_c = None if a.skip_compile else compile_or_none(enc)
     lines.append("| refiner encoder | torch eager | torch.compile | ORT fp32 | ORT weight-only int8 | ORT dynamic int8 |\n|---|---|---|---|---|---|")
     for n in (5000, 20000):
         t = latency_inputs(n, sd["in_dim"], sd["n_eigs"]); feeds = {k: v.numpy() for k, v in zip(INPUTS, t)}
@@ -74,7 +77,7 @@ def main():
         m = GPT2LMHeadModel.from_pretrained("gpt2", attn_implementation="eager").eval()
         ids = torch.randint(0, 50257, (1, a.seq)); feeds = {"input_ids": ids.numpy()}
         s32, s8 = sess(g32), sess(g8); sw8 = sess(os.path.join(art, "gpt2_w8.onnx"))
-        m_c = compile_or_none(m)
+        m_c = None if a.skip_compile else compile_or_none(m)
         with torch.no_grad():
             e = timed(lambda: m(input_ids=ids, use_cache=False).logits, a.runs)
             c = timed(lambda: m_c(input_ids=ids, use_cache=False).logits, a.runs) if m_c is not None else float("nan")
