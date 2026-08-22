@@ -1,0 +1,41 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  export-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r requirements-export.txt
+      - run: python export/export_refiner.py
+      - run: python export/export_gpt2.py --max-tokens 1024
+      - run: python export/weight_only_int8.py artifacts/refiner_encoder.onnx artifacts/refiner_encoder_w8.onnx
+      - run: python export/weight_only_int8.py artifacts/gpt2.onnx artifacts/gpt2_w8.onnx
+      - run: pytest -q
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onnx-artifacts
+          path: |
+            artifacts/refiner_encoder.onnx
+            artifacts/refiner_encoder_w8.onnx
+            artifacts/gpt2_w8.onnx
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: results/
+          retention-days: 30
+  docker:
+    needs: export-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: onnx-artifacts, path: artifacts/ }
+      - run: docker build -t model-deploy .
+      - run: |
+          docker run -d -p 8000:8000 --name md model-deploy
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8000/health && break; sleep 2; done
+          curl -sf http://127.0.0.1:8000/health | tee health.json
+          docker logs md | tail -5

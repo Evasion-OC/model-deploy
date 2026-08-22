@@ -1,0 +1,7 @@
+# Runtime (what the container runs): inference only, no PyTorch.
+onnxruntime>=1.18
+fastapi>=0.110
+uvicorn>=0.29
+numpy>=1.26
+pydantic>=2
+tiktoken>=0.7

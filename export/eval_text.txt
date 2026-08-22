@@ -1,0 +1,321 @@
+# Making the spectral-mix layer faster: analysis first, kernels second
+
+The global branch of this model is `LanczosSpectralMix` (src/graph_transformer.py): a
+learnable spectral convolution on the precomputed low-rank Laplacian eigenbasis. The
+eigenpairs come from ARPACK once per graph; this layer is what runs at every layer of
+every forward pass, so it is the hot path. This directory makes it faster twice, in
+order of how much each step is worth.
+
+## Step 1: the algebraic rewrite (the big win, and no kernel involved)
+
+The eager forward ends with
+
+    Z = V @ S        # (n, d) @ (d, c*m)  -> materialises (n, c*m)
+    out = proj(Z)    # Linear(c*m -> c)
+
+with repo defaults d=16, c=128, m=8, so c*m = 1024. By associativity of matmul,
+
+    proj(V @ S) = V @ (S @ W_proj^T) + b
+
+and `S @ W_proj^T` is (d, c) = (16, 128): tiny, and independent of n.
+
+Consequences, counted exactly for the last two steps:
+
+- multiplies drop from n*d*(c*m) + n*(c*m)*c = 147,456*n to d*(c*m)*c + n*d*c =
+  2,048*n + 2.1M, a ~72x reduction at any realistic n;
+- the (n, 1024) intermediate is never materialised. At n = 50,000 that tensor is
+  51.2M elements: ~100 MB in bf16, ~205 MB in fp32, per layer, per forward.
+
+The rewrite is exact in real arithmetic and agrees with the eager path to < 1e-5
+relative in fp32 (test_correctness.py), including on degenerate eigenblocks, where
+both paths keep the model's basis-invariance property.
+
+Prediction, before benchmarking: after the rewrite the layer is memory-bound on
+reading V (n*16) and h (n*128) and writing out (n*128), roughly 5% of the eager
+path's traffic. Expected wall-clock gain at n=50k is bounded by the eager path's
+share of time in the last two steps; the n-sweep in bench.py measures where the
+crossover between launch-bound and bandwidth-bound sits.
+
+## Step 2: the Triton kernel (the remaining margin)
+
+After the rewrite, the n-scale work is two tall-skinny GEMMs (d=16) and a bias add.
+cuBLAS handles tall-skinny shapes well but not always optimally at K=16, and the
+bias is a separate launch. `_vm_bias_kernel` fuses `out = V @ M + b` into one kernel:
+one K-tile (d fits a single BLOCK_D), autotuned over block sizes and warps.
+
+Honest expectation: the kernel's margin over `torch.compile` on the rewrite is
+small, and `torch.compile` may match it; both are benchmarked side by side, and
+whichever wins, the comparison is reported as measured.
+
+## Files
+
+- `spectral_mix_opt.py` - eager reference, rewrite, Triton path (GPU-gated)
+- `test_correctness.py` - CPU-runnable gates + GPU gate for the kernel
+- `bench.py`            - n-sweep {1k, 10k, 50k, 200k, 1M}, 5 arms, CUDA events,
+                          median/IQR over 100 iters, CSV + meta
+
+## Results (A100-PCIE-40GB, torch 2.13.0+cu130, triton 3.7.1, 19 Aug 2026)
+
+All four correctness gates passed on the GPU, including triton == rewrite.
+Median ms over 100 iterations, CUDA events, 10 warmup. fp32 ran with TF32
+off (torch default; the profile shows ampere_sgemm, i.e. true fp32 kernels),
+so a TF32 arm is untapped headroom, not part of these numbers.
+
+fp32:
+
+| n | eager | rewrite | compile(eager) | compile(rewrite) | triton |
+|---|---|---|---|---|---|
+| 1,000     | 0.296  | 0.278 | 0.297  | 0.262 | 0.399 |
+| 10,000    | 0.449  | 0.270 | 0.461  | 0.301 | 0.460 |
+| 50,000    | 1.296  | **0.308** | 1.313  | 0.474 | 0.337 |
+| 200,000   | 4.130  | 0.551 | 4.107  | 1.011 | **0.425** |
+| 1,000,000 | 20.217 | 2.053 | 20.148 | 4.346 | **1.445** |
+
+bf16:
+
+| n | eager | rewrite | compile(eager) | compile(rewrite) | triton |
+|---|---|---|---|---|---|
+| 1,000     | 0.284 | 0.303 | 0.300 | 0.307 | 0.450 |
+| 10,000    | 0.286 | 0.309 | 0.341 | 0.344 | 0.464 |
+| 50,000    | 0.440 | **0.318** | 0.477 | 0.349 | 0.345 |
+| 200,000   | 0.982 | 0.406 | 0.939 | **0.309** | 0.358 |
+| 1,000,000 | 4.334 | 1.286 | 4.236 | **0.870** | 0.938 |
+
+### The three findings
+
+1. **torch.compile does not find the rewrite.** Measured: compile(eager)
+   matches eager at every size and both dtypes (torch 2.13, default mode).
+   Why, as an argument rather than a measurement: reassociating a matmul
+   chain is an algebraic transformation, not a fusion, and Inductor's passes
+   fuse and pattern-match; they do not search reassociations. The analysis
+   found a 4-10x (fp32) that the compiler did not.
+2. **The profile confirms the mechanism.** In eager at n = 50k, the (n, 1024)
+   GEMM (ampere_sgemm_32x128_tn) is 81% of all CUDA time (30.3 of 37.5 ms
+   over the profiled window). The rewrite deletes that tensor: total device
+   time drops 7.7x (37.5 -> 4.9 ms); wall time 4.2x at 50k, ~10x at 1M.
+3. **The Triton kernel earns its keep at scale, and only there.** It loses at
+   small n to launch overhead, matches the rewrite at 50k, and wins from
+   ~100k up: at n = 1M fp32 it is 1.42x over the rewrite and 14x over eager.
+   In bf16, compile(rewrite) edges it at the largest sizes (0.870 vs 0.938 at
+   1M) -- tensor cores shrink every GEMM, so all gaps narrow, and the honest
+   summary is: rewrite always, then compile or the kernel depending on dtype
+   and size. Reported as measured, per the plan.
+
+### Predictions vs measurements
+
+- Predicted: the layer is launch-bound at small n with a floor set by the op
+  chain. Measured: a ~0.27-0.31 ms floor across all fast arms below n = 10k.
+- Predicted: the rewrite's win is bounded by the eager tail's share of time.
+  Measured: 81% of eager device time was exactly that tail; the wall-clock
+  ratio tracks it.
+- Predicted: compile may match the hand-written kernel. Measured: true in
+  bf16 at large n; false in fp32, where the kernel holds a 1.4x margin at 1M.
+
+## Status
+
+- [x] rewrite implemented and verified locally (CPU, fp32, incl. degenerate blocks)
+- [x] Triton kernel written, autotune configs in place
+- [x] GPU run: all gates + fp32/bf16 sweeps + profile on A100 (results/ committed)
+- [ ] integrate the rewrite into `LanczosSpectralMix.forward` behind a flag
+# Weight quantization of the deployed refiner: error model, measurement, ablation
+
+Post-training, weight-only, symmetric fake quantization of the shipped
+`spectral_refiner_*` checkpoints, written by hand (~20 lines of scheme code in
+`quantize.py`) so the scheme is fully controlled and the error model is legible.
+
+## The error model, stated before measuring
+
+For symmetric b-bit quantization the rounding error is ~U[-s/2, s/2] with
+s = max|W|/(2^(b-1)-1), giving
+
+    SQNR ~= 12 (2^(b-1)-1)^2 / numel * ||W||_F^2 / max|W|^2
+
+Three predictions follow: (1) ~6 dB lost per bit removed, (2) sensitivity is
+governed by dynamic range max|W|/RMS(W), not tensor size or spectrum,
+(3) per-channel scales recover most of what outlier channels cost.
+
+## What was measured (all four checkpoints, k = 4/8/16/32)
+
+`report.py`, per weight tensor: measured SQNR under {int8, int4} x {per-tensor,
+per-channel}, the closed-form predicted SQNR, and dynamic range. The
+predictions hold: int8 per-tensor sits ~40 dB, int4 ~15 dB (the 6 dB/bit rule),
+per-channel adds 4-5 dB, and the worst layers are exactly the highest-dynamic-
+range ones. Weights: 0.72 MB fp32 -> 0.18 MB int8 -> 0.09 MB int4.
+
+`ablate.py`, encoder output drift on fixed synthetic probe graphs (proxy metric,
+runnable without the benchmark suite), k16 checkpoint:
+
+| scheme | whole-model drift |
+|---|---|
+| int8 per-tensor  | 0.52% |
+| int8 per-channel | 0.34% |
+| int4 per-tensor  | 8.7%  |
+| int4 per-channel | 5.8%  |
+
+Single-layer ablation (int4 pt) ranks `in_proj` as the most sensitive tensor
+(6.3% drift on its own), then the first layer's local/FFN blocks: early-layer
+error compounds through depth, late layers are cheap to quantize.
+
+**Invariance is preserved under quantization, measured rather than assumed:**
+vertex-permutation and degenerate-eigenspace-rotation invariance hold to
+~1e-7 on the quantized model under every scheme. Quantization commutes with
+the model's symmetry structure, as it should (the schemes act on weights,
+the invariances are architectural), and now there is a number saying so.
+
+## Honest scope notes
+
+- Drift on synthetic probes is a functional proxy, not task accuracy. The
+  task-level ablation (cut ratio vs METIS through the real pipeline) plugs in
+  via `eval_fn` and needs the benchmark graphs: a longer, offline run.
+- One tie-break difference per ~8k elements against
+  `torch.fake_quantize_per_tensor_affine` (round-half cases), max one
+  quantization step: found by the sanity check, bounded, documented.
+- Weight-only. Activation quantization needs calibration data and is where
+  outliers genuinely bite; out of scope here, noted as future work.
+
+## Files
+
+- `quantize.py`   - scheme + SQNR/dynamic-range stats + torch-reference sanity
+- `report.py`     - per-layer tables for a checkpoint (CSV in results/)
+- `ablate.py`     - whole-model + per-layer drift, invariance checks (CSV)
+
+## Cross-checkpoint results (k4/k8/k16/k32, A100 run 19 Aug 2026)
+
+Whole-model int4 per-tensor drift: k4 16.0%, k8 19.1%, k16 8.7%, **k32 4.5%**
+(int8 stays under 1.3% everywhere; per-channel helps at every k). Two patterns
+hold across all four checkpoints: **in_proj is the most sensitive tensor at
+every k**, and the invariances (permutation, degenerate rotation) hold to
+~2e-7 on the quantized model under every scheme. The wider-PE k32 model is
+markedly more quantization-robust than k4/k8; noted, not yet explained.
+
+## Status
+
+- [x] quantizer verified against the torch reference (tie-break-aware)
+- [x] per-layer SQNR/range report, all four shipped checkpoints
+- [x] drift ablation + invariance preservation, all four checkpoints (A100)
+- [ ] task-level ablation through the benchmark pipeline (offline run)
+# The A100 track
+
+The speedrun's records run on 8x H100. This directory reproduces the record
+ladder on 1-2x A100-PCIE-40GB (a shared university node), measures what each
+rung is worth there, and documents which rungs are H100-only (FP8, FA3) --
+numbers the main repo does not have.
+
+Method: same fixed target as the speedrun (val loss 3.28 on FineWeb), same
+scripts. The early record scripts define the GLOBAL batch independently of
+world size and compute gradient-accumulation steps at runtime, so a 1- or
+2-GPU run reproduces the 8-GPU training trajectory exactly; only wall time
+changes. Later rungs must be checked per script (classification.md).
+
+MEASURED (smoke, 19 Aug 2026, Muon rung @ device_bs=32, global batch 512):
+- step_avg 3,300 ms on 1x A100, 1,700 ms on 2x = **1.94x, 97% scaling efficiency**.
+  The PCIe penalty predicted below did not materialise: with 16 accumulation
+  micro-steps per optimizer step, gradient sync amortises almost completely.
+- Full Muon rung projection: 6,200 steps x 1.70 s = **~2.9 h on 2 GPUs** (~5.7 h
+  on 1). The 45-90 min prediction below was optimistic by ~2x; kept for the record.
+- device_batch_size 64 OOMs on 40 GB (the 6.1 GB bf16 logits tensor); 32 fits.
+  Global batch unchanged, so tokens-to-target stays comparable to the records.
+
+MEASURED (first full rung, 20 Aug 2026, job 1055947): record #4, 2024-10-10_Muon
+- 6,200 steps on 2x A100 in **2.92 h** train time, step_avg 1,696.63 ms — the
+  600 s smoke's 1,700 ms projection was exact. Peak memory 19,711 MiB.
+- **Conversion ratio kappa = 1696.63 / 216.33 = 7.84** (their 8xH100 step_avg
+  from the record log). Dense-era rungs are projected at kappa x their record
+  time; flex-era rungs get their own 600 s smoke first.
+- Final val loss **3.3114 vs the record's 3.2785** at the same step: a drift of
+  **Delta = +0.033**. The full 51-milestone trace gives its fingerprint:
+  the scripts are UNSEEDED, so inits differ (step-0 val +0.089 apart); the
+  high-LR phase erases that completely (steps 250-2500 sit within +-0.005 with
+  flipping sign — pure numerics noise); then the gap grows monotonically
+  through the LR-decay half (+0.010 at 3750, +0.020 at 4375, +0.026 at 5000,
+  +0.033 at 6200, decelerating). A small persistent bias that only integrates
+  once the learning rate anneals.
+- **It is outside run-to-run noise, measurably.** The repo's own ValueEmbed dir
+  holds 38 same-config runs; their README computes std 0.0040 and our
+  recomputation over the logs agrees exactly (mean 3.2776, std 0.0041). Delta =
+  +0.033 is therefore **~8 sigma**: systematic, not a seed artifact.
+- It is NOT gradient-accumulation rounding: this script keeps parameters — and
+  therefore accumulated grads — in fp32 under bf16 autocast (model.cuda(), no
+  bf16 cast), and 8-term fp32 sums cannot move a loss by 0.03. Prime suspect is
+  kernel-level numerics of a different stack: torch 2.13 / inductor / sm80 here
+  vs torch 2.4.1 / sm90 there.
+- **Attribution run A0**: the same rung with compilation disabled
+  (EXTRA_ARGS=--no-compile, which comments out torch.compile via get_script).
+  Decision rule, honest about seed noise: A0's own final val carries +-0.004,
+  so inductor is implicated only if A0 moves more than ~2 sigma = 0.008 away
+  from 3.3114; within that band, inductor is exonerated and the drift lives in
+  the bf16/SDPA kernels both paths share. In-between: one more A0 seed.
+- **A0 MEASURED (job 1055988): eager 3.3113 vs compiled 3.3114** at step 6200,
+  and within 1e-3 at every late milestone (5000: 3.3862/3.3872; 3750:
+  3.4516/3.4521). **Inductor is exonerated**: the drift lives below the
+  compiler — sm80-vs-sm90 kernel numerics (Muon's bf16 Newton-Schulz
+  iteration is a prime candidate), autocast-policy changes between torch 2.4
+  and 2.13, or the SDPA backend. Two free measurements: torch.compile =
+  **1.94x step time** (3,284 vs 1,697 ms) and **40% less peak memory** (32.8
+  vs 19.7 GB) on this workload. Early milestones differ (step 125: 5.2192 vs
+  5.2017, step 0: 11.0211 vs 11.0150 — PyTorch's default generator has a
+  fixed seed, so the inits are plausibly identical and the step-0 gap is
+  forward-pass numerics) and the high-LR phase erases them: the late-phase
+  state is set by the stack both paths share. Next attribution lever, only if
+  the buffer window allows: one run with the SDPA math backend forced.
+- Ladder metric: **Delta at the record's own step budget, every rung on our one
+  fixed stack.** Since runs are unseeded on both sides, each rung's Delta
+  carries sigma_Delta ~ 0.006; individual rung Deltas under ~0.01 are noise,
+  and the reportable object is the drift pattern across all 14 rungs (the mean
+  drift is known to ~sigma/sqrt(14)). No step-extension reruns.
+
+## Run schedule (set 20 Aug; jobs run serially on the shared 2-GPU node)
+
+| when | submit | projected wall |
+|---|---|---|
+| 20 Aug | A0 (eager Muon, sbatch --time=10:00:00) + rung #5 ModernArch | ~4-6 h + 2.0 h |
+| 21 Aug | #6 DistributedMuon, #7 PyTorch25, #8 UntieEmbed | 1.7 + 1.6 + 1.4 h |
+| 22 Aug | #9 ShortcutsTweaks, #10 CastBf16, #11 UNetDoubleLr | 1.1 + 1.0 + 0.9 h |
+| 23 Aug | flex smokes #12-#18 (TIMEOUT=600 each): peak mem + step_avg on sm80 | ~1.5 h total |
+| 24-25 Aug | flex full runs #12-#18, go/no-go per smoke | ~4-6 h total |
+| 26-31 Aug | buffer: queue contention, redos; 1-vs-2-GPU scaling pair on #5 and #11; A0 follow-up if inductor is implicated | — |
+| 1-12 Sep | no GPU needed: analysis + REPORT.md (Delta ladder, kappa by era, what-transferred taxonomy, numerics section) | — |
+
+That lands all compute by ~1 Sep — a month inside the October access horizon,
+with two spare weeks against surprises. After each rung: commit
+a100/results/<record>/ and push, so the repo, not the cluster, is the record.
+
+Predictions, before measuring (kept for reconciliation, refiner-perf style):
+- bf16-era rungs at ~3-8 min on 8xH100 land at roughly 45-90 min on 2xA100,
+  2-4 h on 1xA100 (GPU count x per-GPU speed x PCIe; estimate, not measurement).
+- DDP scaling on a PCIe pair will be visibly sub-linear; smoke.sbatch measures
+  the 1-vs-2-GPU step-time ratio explicitly and it gets reported, not hidden.
+- FlexAttention on sm80 / torch 2.13 should work; smoke-tested before use.
+
+Environment gotcha #4 (20 Aug): rung #5 died with inductor CppCompileError —
+the node g++ rejects -std=c++20. Install a modern compiler INTO the env
+(self-contained, like the headers fix) and the sbatch exports CXX/CC to it:
+  module load Anaconda3/2025.12-1
+  conda install -y -p ~/envs/nanogpt -c conda-forge --override-channels gxx_linux-64 gcc_linux-64
+
+Workflow on the cluster (login node):
+  1) Environment (ONE TIME, login node). python3.11-devel is missing on BOTH
+     login and GPU nodes, so triton cannot compile its driver shim against the
+     system python. Use a self-contained conda env instead:
+       module load Anaconda3/2025.12-1
+       conda create -y -p ~/envs/nanogpt -c conda-forge --override-channels python=3.11
+       ~/envs/nanogpt/bin/pip install --upgrade pip
+       ~/envs/nanogpt/bin/pip install torch scipy huggingface_hub tqdm
+     Jobs pick it up automatically (PATH-first activation in the sbatch files).
+  2) python data/cached_fineweb10B.py 24     # shards; ~few GB per unit, needs quota
+  3) sbatch a100/smoke.sbatch                # 10-step sanity, 1 then 2 GPUs
+  4) RECORD=2024-10-14_ModernArch GPUS=2 sbatch a100/run_rung.sbatch
+  5) Eager attribution variant (A0):
+       RECORD=2024-10-10_Muon GPUS=2 TAG=eager EXTRA_ARGS=--no-compile \
+         sbatch --time=10:00:00 a100/run_rung.sbatch
+  6) Flex-era smoke (memory + step_avg audit before any full flex run):
+       RECORD=2024-11-19_FlexAttention GPUS=2 TAG=smoke TIMEOUT=600 \
+         sbatch --partition=gpu-short a100/run_rung.sbatch
+
+Everything derives from KellerJordan/modded-nanogpt (MIT). Most records ship no
+.py — the script that ran is embedded in the record's log; a100/get_script.py
+extracts it (preferring the README-linked log when a dir holds several dozen
+side logs) and applies only declared, anchor-verified adaptations. Data
+assumption: the fineweb10B shards (kjj0/fineweb10B-gpt2) are the same frozen
+set the records trained on. Per-rung changes are declared in classification.md
+and the results table.
