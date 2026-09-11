@@ -4,6 +4,7 @@ torch>=2.4
 onnx>=1.16
 onnxscript>=0.2   # required by the torch.export-based ONNX exporter (GPT-2)
 transformers>=4.44
+datasets>=2.18      # WikiText-2 for the GPT-2 accuracy numbers
 scipy>=1.11
 pytest>=8
 httpx>=0.27

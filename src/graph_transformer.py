@@ -37,7 +37,7 @@ class LocalMPNN(nn.Module):
         # cast adjacency to h's dtype so index_add_ matches under autocast (h is bf16, adj_* fp32)
         msg = h[src] * adj_weights.unsqueeze(1).to(h.dtype)
         # scatter_add instead of index_add_: identical sum, but index_add_ exports to ONNX as a
-        # ScatterElements WITHOUT reduction (duplicate destinations overwrite instead of summing),
+        # ScatterElements without a reduction (duplicate destinations overwrite instead of summing),
         # which silently corrupts the aggregation; scatter_add lowers with reduction="add" (opset >= 16).
         aggr = torch.zeros_like(h).scatter_add(0, dst.unsqueeze(1).expand_as(msg), msg) * deg_inv.unsqueeze(1).to(h.dtype)
         return F.gelu(self.W_self(h) + self.W_neigh(aggr))

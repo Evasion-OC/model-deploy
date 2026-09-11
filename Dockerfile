@@ -1,4 +1,4 @@
-# Serving image: ONNX Runtime + FastAPI only. No PyTorch, no model code — just the exported graphs.
+# Serving image: ONNX Runtime and FastAPI with the exported graphs. No PyTorch and no model code.
 FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .

@@ -30,8 +30,8 @@ def session(name: str) -> ort.InferenceSession:
 
 
 def gpt2_artifact() -> str:
-    """Preference: weight-only int8 (lossless on our sample, half the size) > fp32 > ORT dynamic int8
-    (+0.15 nats on our sample; kept only as a fallback). Override with GPT2_ONNX=<file>."""
+    """Preference: weight-only int8 (+0.0015 nats on WikiText-2, half the size) > fp32 > ORT dynamic int8
+    (+0.34 nats, fallback only). Override with GPT2_ONNX=<file>."""
     pref = os.environ.get("GPT2_ONNX")
     if pref:
         return pref

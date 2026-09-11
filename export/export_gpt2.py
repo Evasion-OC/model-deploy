@@ -1,6 +1,6 @@
 """GPT-2 (124M): PyTorch -> ONNX -> ONNX Runtime, with parity, ORT dynamic int8, and a hand-written
-weight-only int8 for comparison. Accuracy metric: mean next-token NLL on a fixed text sample
-(export/eval_text.txt, our own READMEs), so every variant is scored on identical tokens.
+weight-only int8 for comparison. Accuracy metric: mean next-token NLL on the first --max-tokens
+tokens of the WikiText-2 (raw) test split, so every variant is scored on identical tokens.
 
     python export/export_gpt2.py                 # writes artifacts/gpt2.onnx, artifacts/gpt2_int8.onnx,
                                                  # results/gpt2_accuracy.{json,md}
@@ -70,12 +70,20 @@ def nll_ort(sess, ids, seq):
     return tot / cnt
 
 
+def eval_text(path=None):
+    """The evaluation text: a local file if given, else the WikiText-2 (raw) test split."""
+    if path:
+        return open(path, encoding="utf-8").read()
+    from datasets import load_dataset
+    return "\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="gpt2")
     ap.add_argument("--out-dir", default="artifacts")
     ap.add_argument("--results-dir", default="results")
-    ap.add_argument("--text", default="export/eval_text.txt")
+    ap.add_argument("--text", default=None, help="score a local text file instead of WikiText-2")
     ap.add_argument("--seq", type=int, default=256)
     ap.add_argument("--max-tokens", type=int, default=4096)
     a = ap.parse_args()
@@ -84,7 +92,7 @@ def main():
 
     tok = GPT2TokenizerFast.from_pretrained(a.model)
     model = GPT2LMHeadModel.from_pretrained(a.model, attn_implementation="eager").eval()
-    ids = tok.encode(open(a.text, encoding="utf-8").read())[: a.max_tokens]
+    ids = tok.encode(eval_text(a.text))[: a.max_tokens]
     print(f"{a.model}: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params; eval sample {len(ids)} tokens, seq {a.seq}")
 
     # 1) export (TorchScript-based exporter, dynamic batch/seq)
@@ -130,7 +138,8 @@ def main():
            "sizes_mb": {"onnx_fp32": os.path.getsize(path32)/1e6, "onnx_int8": os.path.getsize(path8)/1e6}}
     json.dump(out, open(os.path.join(a.results_dir, "gpt2_accuracy.json"), "w"), indent=2)
     with open(os.path.join(a.results_dir, "gpt2_accuracy.md"), "w") as f:
-        f.write(f"## GPT-2 ({a.model}) accuracy on a fixed {len(ids)}-token sample (seq {a.seq})\n\n")
+        src = a.text or "the WikiText-2 (raw) test split"
+        f.write(f"## GPT-2 ({a.model}): mean NLL on the first {len(ids)} tokens of {src} (seq {a.seq})\n\n")
         f.write("| variant | mean NLL | delta vs torch fp32 | what is quantized |\n|---|---|---|---|\n")
         what = {"torch_fp32": "nothing", "torch_manual_int8_weight_only": f"{nq} block Conv1D weights, per-output-channel int8 (weight-only)",
                 "ort_fp32": "nothing (ONNX Runtime)", "ort_dynamic_int8": "all MatMul weights incl. lm_head to int8 + dynamic int8 activations"}

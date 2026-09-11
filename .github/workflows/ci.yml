@@ -12,6 +12,7 @@ jobs:
       - run: python export/export_gpt2.py --max-tokens 1024
       - run: python export/weight_only_int8.py artifacts/refiner_encoder.onnx artifacts/refiner_encoder_w8.onnx
       - run: python export/weight_only_int8.py artifacts/gpt2.onnx artifacts/gpt2_w8.onnx
+      - run: python export/eval_weight_only.py
       - run: pytest -q
       - uses: actions/upload-artifact@v4
         with:

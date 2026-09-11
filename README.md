@@ -1,101 +1,103 @@
-# model-deploy — export, quantize, serve, measure
+# model-deploy
 
-Two models taken from PyTorch to a served ONNX Runtime container, with every step measured and
-two quantization toolchains compared on the same graphs:
+Exporting two PyTorch models to ONNX Runtime, quantizing them, serving them, and measuring each step.
+The models are the graph transformer encoder from
+[multilevel-partition-refinement](https://github.com/Evasion-OC/multilevel-partition-refinement)
+(174k parameters, with a Lanczos spectral mixer; the checkpoint is included here) and GPT-2 124M
+(the public `gpt2` weights).
 
-- the **partition-refiner encoder** from [multilevel-partition-refinement](https://github.com/Evasion-OC/multilevel-partition-refinement)
-  (174k params, graph transformer with a Lanczos spectral mixer; checkpoint shipped here), and
-- **GPT-2 124M** (public `gpt2` weights; the same path works for any GPT-2-class checkpoint).
+For each model the repo exports an ONNX graph and checks it against PyTorch, compares ONNX Runtime's
+dynamic int8 quantization with a hand-written weight-only int8 scheme, times the variants on CPU, and
+serves them from a FastAPI app in a Docker image that contains ONNX Runtime and the exported graphs
+but no PyTorch.
 
-```
-PyTorch ──torch.onnx.export──▶ ONNX ──┬─▶ ONNX Runtime fp32           (parity checked vs torch)
-                                      ├─▶ ORT quantize_dynamic int8   (the standard tool; measured, then rejected)
-                                      └─▶ weight-only int8 via DequantizeLinear (our scheme, as a deployable graph)
-                                                        │
-                                FastAPI + ONNX Runtime ◀┘   Docker image (no PyTorch inside), tests, CI
-```
+## Results
 
-## Results (CPU, Apple M-series; every number reproducible with the commands below)
+Timings are from an Apple M1 Pro CPU. Every table is produced by the commands under "Reproducing".
 
 ### Export parity
-| model | exporter | parity vs PyTorch | shapes |
+
+| model | exporter | difference from PyTorch | dynamic shapes |
 |---|---|---|---|
-| refiner encoder | TorchScript-based (`dynamo=False`), opset 17 | relative output drift **2×10⁻⁷** on unseen graphs | dynamic `n` nodes and `E` edges |
-| GPT-2 124M | `torch.export`-based (`dynamo=True`), opset 18 | max logit difference **8×10⁻⁴** | batch 1, dynamic sequence length |
+| refiner encoder | TorchScript-based (`dynamo=False`), opset 17 | relative output difference 2e-7 on graphs not used for the export | nodes n, edges E |
+| GPT-2 124M | `torch.export`-based (`dynamo=True`), opset 18 | max logit difference 8e-4 | sequence length (batch 1) |
 
-**Finding 1 — a silent exporter bug.** The encoder's message passing used `index_add_` with duplicate
-destination indices. The TorchScript exporter lowers `index_add_` to a `ScatterElements` *without* a
-reduction attribute, so contributions to the same node overwrite instead of summing; the exported
-graph ran without any error and drifted **34%** from PyTorch. The fix is the export-friendly equivalent,
-`scatter_add`, which lowers with `reduction="add"` (opset ≥ 16); the torch forward is unchanged (verified
-equal) and the graph now matches to 2×10⁻⁷. `tests/test_export.py` keeps a duplicate-edge regression test.
+The first export of the encoder ran without errors but its output differed from PyTorch by 34%.
+The message-passing layer used `index_add_`, which the TorchScript exporter turns into a
+`ScatterElements` node with no reduction, so edges that share a destination node overwrite each other
+instead of adding up. `scatter_add` gives the same result in PyTorch and exports with
+`reduction="add"` (opset 16 and later), which brings the difference down to 2e-7.
+`tests/test_export.py` keeps a regression test with duplicated edges.
 
-### Quantization: two toolchains, same graphs
-| model | ORT `quantize_dynamic` int8 | hand-written weight-only int8 (per-channel) |
+### Quantization
+
+| | ONNX Runtime `quantize_dynamic` (int8) | hand-written weight-only int8, per channel |
 |---|---|---|
-| refiner encoder, output drift vs fp32 | **53–65%** | **0.4–0.6%** |
-| GPT-2, mean NLL on a fixed 4,096-token sample (fp32: 4.758) | 4.911 (**+0.153 nats**) | 4.755 (**−0.003**, lossless) |
+| refiner encoder: output drift from fp32 | 53 to 65% | 0.4 to 0.6% |
+| GPT-2: mean NLL on 4,096 WikiText-2 test tokens (fp32 3.847) | 4.184 (+0.34 nats) | 3.848 (+0.002) |
 
-**Finding 2 — the standard tool quantizes the wrong nodes here.** A variant sweep
-(`results/refiner_ort_quant_variants.md`) shows `quantize_dynamic` never touches the 17 `Gemm` nodes that
-hold this model's `nn.Linear` weights (restricting it to `Gemm` changes nothing: 0.00% drift) and instead
-quantizes the 11 weight-free spectral `MatMul`s (Vᵀh, V·M, (V²)·Φ) with per-tensor uint8 activations —
-the eigenvector inputs, whose entries sit around 1/√n, are crushed. No option (`per_channel`,
-`reduce_range`, `QUInt8`) changes that. For GPT-2 the same activation quantization costs 0.15 nats.
+`quantize_dynamic` leaves the 17 `Gemm` nodes that hold the encoder's `nn.Linear` weights untouched:
+restricting it to `Gemm` nodes gives 0.00% drift. The error comes from the 11 `MatMul` nodes that carry
+no weights (the products with the eigenvectors), which it quantizes with per-tensor uint8 activations;
+restricting it to those nodes reproduces the full drift. Its options (`per_channel`, `reduce_range`,
+`QUInt8`) make no difference (`results/refiner_ort_quant_variants.md`). On GPT-2 the same
+activation quantization costs 0.34 nats.
 
-**Finding 3 — weight-only int8 as a deployable ONNX graph.** `export/weight_only_int8.py` rewrites every
-`Gemm`/`MatMul` weight initializer to int8 with a per-output-channel scale behind `DequantizeLinear`
-(opset 13), activations untouched — the hand-written scheme from the refiner artifact, now a file ORT
-serves. Refiner: 0.72 → 0.22 MB at 0.4–0.6% drift; GPT-2: 499 → 244 MB at −0.003 nats. This buys file size
-and memory, not CPU compute: int8 *compute* needs activation quantization, which is exactly what damages
-these two models. The server prefers these artifacts.
+`export/weight_only_int8.py` writes the hand-written scheme into the graph itself: each `Gemm` or
+`MatMul` weight becomes an int8 tensor with one scale per output channel, followed by a
+`DequantizeLinear` node, and activations stay in fp32. The encoder goes from 0.72 MB to 0.22 MB at 0.4
+to 0.6% drift, and GPT-2 from 499 MB to 244 MB at +0.0015 nats (`results/weight_only_onnx.md`).
+The server uses these graphs by default.
 
-### Latency (CPU, Apple M-series, 8 torch threads; median of 20 after warm-up; `results/latency.md`)
-| model | torch eager | ORT fp32 | ORT weight-only int8 | ORT dynamic int8 |
+### Latency
+
+| | PyTorch eager | ORT fp32 | ORT weight-only int8 | ORT dynamic int8 |
 |---|---|---|---|---|
-| refiner encoder, n = 5,000 | **22.6 ms** | 55.5 | 56.1 | 53.8 |
-| refiner encoder, n = 20,000 | **86.2 ms** | 233.3 | 235.0 | 224.3 |
-| GPT-2 124M, batch 1, seq 128 | 65.5 ms | 78.5 | 51.7 | **30.9 ms** |
+| refiner encoder, n = 5,000 | 22.6 ms | 55.5 ms | 56.1 ms | 53.8 ms |
+| refiner encoder, n = 20,000 | 86.2 ms | 233.3 ms | 235.0 ms | 224.3 ms |
+| GPT-2 124M, batch 1, 128 tokens | 65.5 ms | 78.5 ms | 51.7 ms | 30.9 ms |
 
-**Finding 4 — the runtime is not automatically the faster one.** For the spectral encoder, ONNX Runtime's CPU
-provider is 2.5–2.7× *slower* than PyTorch eager on this machine (many small ops, scatter-based message
-passing, and no Apple-Accelerate BLAS in ORT's CPU provider), and int8 buys nothing because the Gemm weight
-layers were never quantized (Finding 2). For GPT-2 the picture inverts: ORT dynamic int8 is **2.1× faster**
-than torch eager (int8 MatMul kernels on ARM dot-product instructions) at the +0.15-nat accuracy cost above,
-and the lossless weight-only graph is 1.27× faster than eager. The deployment choice is therefore per model
-and per constraint — size, accuracy, or latency — and this repo measures all three before choosing.
-`torch.compile` is not in the table: its C++ backend stalled on this macOS setup, which is itself a data point.
+Median of 20 runs after warm-up, 8 threads (`results/latency.md`). The two models behave differently.
+For the encoder, ONNX Runtime is 2.5 to 2.7 times slower than PyTorch eager on this CPU, and int8
+changes nothing because its weight layers are never quantized. For GPT-2, dynamic int8 is 2.1 times
+faster than PyTorch eager, at the accuracy cost above, and the weight-only graph is 1.3 times faster
+with no accuracy cost. `torch.compile` is missing from the table because its C++ backend stalled on
+this machine.
 
 ## Serving
-`serve/app.py` (FastAPI, ONNX Runtime only — the image contains no PyTorch and no model code):
 
-- `GET /health` — runtime version and artifacts present
-- `POST /refiner/embed` — node features + eigenpairs + adjacency → node / graph embeddings (fp32 graph by default)
-- `POST /gpt2/score` — mean next-token NLL and perplexity of a text (`gpt2_w8.onnx` by default)
-- `POST /gpt2/generate` — greedy continuation, ≤ 64 tokens (no KV cache in this export; deliberately simple)
+`serve/app.py` runs everything in ONNX Runtime:
+
+- `GET /health`: runtime version and the artifacts present
+- `POST /refiner/embed`: node features, eigenpairs and adjacency in; node and graph embeddings out
+- `POST /gpt2/score`: mean next-token NLL and perplexity of a text
+- `POST /gpt2/generate`: greedy continuation, up to 64 tokens
+
+## Reproducing
 
 ```bash
 pip install -r requirements-export.txt
-python export/export_refiner.py            # artifacts/refiner_encoder{,_int8}.onnx, results/refiner_accuracy.md
-python export/export_gpt2.py               # artifacts/gpt2{,_int8}.onnx, results/gpt2_accuracy.md  (downloads gpt2)
+python export/export_refiner.py         # refiner ONNX graphs, results/refiner_accuracy.md
+python export/export_gpt2.py            # GPT-2 ONNX graphs, results/gpt2_accuracy.md
 python export/weight_only_int8.py artifacts/refiner_encoder.onnx artifacts/refiner_encoder_w8.onnx
 python export/weight_only_int8.py artifacts/gpt2.onnx artifacts/gpt2_w8.onnx
-python export/diagnose_ort_quant.py        # results/refiner_ort_quant_variants.md
-python bench/latency.py                    # results/latency.md
-pytest -q                                  # export parity + API tests
-uvicorn serve.app:app --port 8000          # or: docker build -t model-deploy . && docker run -p 8000:8000 model-deploy
+python export/eval_weight_only.py       # results/weight_only_onnx.md
+python export/diagnose_ort_quant.py     # results/refiner_ort_quant_variants.md
+python bench/latency.py --skip-compile  # results/latency.md
+pytest -q
+uvicorn serve.app:app --port 8000       # or: docker build -t model-deploy . && docker run -p 8000:8000 model-deploy
 ```
 
-CI (`.github/workflows/ci.yml`) exports both models, runs the tests, builds the image and curls `/health`.
+CI (`.github/workflows/ci.yml`) exports both models, runs the tests, builds the image and checks
+`/health`.
 
-## Honest scope
-- CPU only; GPU execution providers are a one-line change but are not measured here.
-- GPT-2 is exported at batch 1 (dynamic sequence) and served without a KV cache; this is a deployment
-  study, not a high-throughput LLM server.
-- The refiner's accuracy metric is encoder-output drift on fixed probe graphs (the same proxy as the
-  quantization artifact); task-level cut quality for the quantized refiner is measured separately in the
-  main repository's benchmark.
-- Weight-only quantization here covers 2-D `Gemm`/`MatMul` initializers (GPT-2: the 48 block weights; the
-  tied embedding/lm-head stays fp32).
+## Limitations
 
-Code for the refiner model is copied from the main repository; everything else is new. MIT.
+- CPU only, and the timings come from one laptop.
+- GPT-2 is exported for batch 1 with variable sequence length and served without a KV cache, so
+  generation recomputes the whole sequence at each step.
+- The encoder's accuracy is measured as output drift on fixed probe graphs, not as partitioning quality.
+- The weight-only scheme covers the 2-D `Gemm` and `MatMul` weights. GPT-2's tied embedding and output
+  layer stay in fp32.
+
+The refiner model code is copied from the main repository.
