@@ -75,7 +75,7 @@ def eval_text(path=None):
     if path:
         return open(path, encoding="utf-8").read()
     from datasets import load_dataset
-    return "\n\n".join(load_dataset("wikitext", "wikitext-2-raw-v1", split="test")["text"])
+    return "\n\n".join(load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split="test")["text"])
 
 
 def main():
